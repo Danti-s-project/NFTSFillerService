@@ -4,8 +4,6 @@ from typing import Optional
 import aiohttp
 import bs4
 
-from nfts.models import NFTCollection, NFT, NFTOwner, NFTSymbol, NFTModel, NFTBackdrop
-
 
 class Worker:
     """
@@ -17,6 +15,7 @@ class Worker:
     """
 
     BASE_URL = 'https://t.me/nft/'
+    HOST = 'http://localhost:8000'
 
     class ParsedInfo:
         """
@@ -28,20 +27,21 @@ class Worker:
             backdrop: Название фона NFT.
             symbol: Название символа NFT.
         """
+
         def __init__(self):
             self.owner: str = ""
             self.model: str = ""
             self.backdrop: str = ""
             self.symbol: str = ""
 
-    def __init__(self, collection: NFTCollection):
+    def __init__(self, collection_name: str):
         """
         Инициализирует Worker для указанной коллекции NFT.
 
         Args:
-            collection: Коллекция NFT для индексации.
+            collection_name: Коллекция NFT для индексации.
         """
-        self.__collection: NFTCollection = collection
+        self.__collection: str = collection_name
         self.__serve_task: Optional[asyncio.Task] = None
 
     def run(self):
@@ -59,8 +59,12 @@ class Worker:
 
         Цикл продолжается до тех пор, пока не будут проиндексированы все NFT в коллекции.
         """
-        while self.__collection.indexed < self.__collection.quantity:
-            await self.__request()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{Worker.HOST}/api/v1/collections/{self.__collection}/") as response:
+                collection_data = await response.json()
+                while collection_data["indexed"] < collection_data["quantity"]:
+                    await self.__request()
 
     async def __request(self):
         """
@@ -69,33 +73,33 @@ class Worker:
         Если ответ успешный (код 200), данные парсятся и сохраняются в базу данных.
         """
         async with aiohttp.ClientSession() as session:
-            async with session.get(self.__get_next_url()) as response:
+            async with session.get(await self.__get_next_url()) as response:
                 if response.status == 200:
                     await self.__write_to_database(self.__parse_info(await response.text()))
 
-    def __get_next_url(self) -> str:
+    async def __get_next_url(self) -> str:
         """
         Формирует URL для следующего NFT, требующего индексации.
 
         Returns:
             URL страницы с информацией о следующем NFT в коллекции.
         """
-        return f"{Worker.BASE_URL}{self.__collection.name}-{self.__collection.indexed + 1}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{Worker.HOST}/api/v1/collections/{self.__collection}/") as response:
+                collection_data = await response.json()
+                return f"{Worker.BASE_URL}{self.__collection}-{collection_data["indexed"] + 1}"
 
-    async def __get_or_create_related(self, django_model, name: str):
+    async def __get_or_create_related(self, django_model: str, value: str) -> None:
         """
-        Возвращает инстанс *django_model* по имени *name*
-
-        Ищет в модели *django_model* объект с именем *name*
-        Если его нет, то создает новый объект с именем *name* и сохраняет в базе данных
-
-        return: django_model instance
+            param: django model: Название искомого свойства
+            param: value: значение для свойства
         """
-        instance = await django_model.objects.filter(name=name).afirst()
-        if not instance:
-            instance = django_model(name=name)
-            await instance.asave()
-        return instance
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{Worker.HOST}/api/v1/{django_model}/{value}/") as response:
+                if response.status != 200:
+                    async with session.post(f"{Worker.HOST}/api/v1/{django_model}/", json={"name": value}):
+                        pass
 
     async def __write_to_database(self, nft_info: ParsedInfo) -> None:
         """
@@ -108,19 +112,27 @@ class Worker:
         Args:
             nft_info: Объект с данными о NFT, полученный при парсинге.
         """
-        new = NFT()
+
+        request_json = {}
 
         if nft_info.owner:
-            new.owner = await self.__get_or_create_related(NFTOwner, nft_info.owner)
-        new.model = await self.__get_or_create_related(NFTModel, nft_info.model)
-        new.backdrop = await self.__get_or_create_related(NFTBackdrop, nft_info.backdrop)
-        new.symbol = await self.__get_or_create_related(NFTSymbol, nft_info.symbol)
+            request_json["owner"] = await self.__get_or_create_related("owner", nft_info.owner)
+        request_json["model"] = await self.__get_or_create_related("model", nft_info.model)
+        request_json["backdrop"] = await self.__get_or_create_related("backdrop", nft_info.backdrop)
+        request_json["symbol"] = await self.__get_or_create_related("symbol", nft_info.symbol)
 
-        await new.asave()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{Worker.HOST}/api/v1/nft/", json=request_json):
+                pass
 
         # Увеличиваем счётчик проиндексированных NFT
-        self.__collection.indexed += 1
-        await self.__collection.asave()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{Worker.HOST}/api/v1/collections/{self.__collection}/") as response:
+                collection_data = await response.json()
+                async with session.patch(f"{Worker.HOST}/api/v1/collections/{self.__collection}/",
+                                         json={"quantity": collection_data["indexed"] + 1}):
+                    pass
 
     def __parse_info(self, content: str) -> ParsedInfo:
         """
@@ -143,7 +155,7 @@ class Worker:
                 case "Owner":
                     owner_url = value_element.find("a")
                     if owner_url:
-                       info.owner = owner_url.text
+                        info.owner = owner_url.text
                 case "Model":
                     info.model = value_element.text
                 case "Backdrop":

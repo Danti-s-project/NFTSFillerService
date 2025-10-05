@@ -1,7 +1,6 @@
 from typing import List
 
-from nfts.models import NFTCollection
-from nfts.service.worker import Worker
+from worker import Worker
 
 
 class WorkerManager:
